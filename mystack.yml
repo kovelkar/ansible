@@ -1,0 +1,185 @@
+- name: DB setup
+  hosts: nodes
+  become: yes
+  tags: DB
+  tasks:
+    - name: install MariaDB server
+      package:
+        name: "{{item}}"
+        state: installed
+      loop:
+        - mariadb-server
+        - MySQL-python
+
+    - name: Starting mariadbb
+      systemd:
+        name: mariadb
+        state: started
+        enabled: True
+
+    - name: Creating student.sql
+      blockinfile:
+        path: /home/ec2-user/student.sql
+        block: |
+            CREATE TABLE if not exists Students(student_id INT NOT NULL AUTO_INCREMENT,
+            student_name VARCHAR(100) NOT NULL,
+            student_addr VARCHAR(100) NOT NULL,
+            student_age VARCHAR(3) NOT NULL,
+            student_qual VARCHAR(20) NOT NULL,
+            student_percent VARCHAR(10) NOT NULL,
+            student_year_passed VARCHAR(10) NOT NULL,
+            PRIMARY KEY (student_id)
+            );
+        state: present
+        create: yes
+
+    - name: configuring student app database
+      mysql_db:
+        state: import
+        name: studentapp
+        target: /home/ec2-user/student.sql
+    
+    - name: creating dataase user
+      mysql_user:
+        name: student
+        password: student@1
+        priv: '*.*:ALL,GRANT'
+        state: present
+          
+- name: Appserver setup
+  hosts: nodes
+  vars:
+  #URL: http://www-us.apache.org/dist/tomcat/tomcat-connectors/jk/tomcat-connectors-1.2.44-src.tar.gz
+    URL: https://archive.apache.org/dist/tomcat/tomcat-9/v9.0.6/bin/apache-tomcat-9.0.6.tar.gz
+    WAR_URL: https://github.com/cit-aliqui/APP-STACK/raw/master/student.war
+
+  tags: APP
+  become: yes
+  tasks: 
+    - name: java install
+      package:
+        name: java
+        state: installed
+    
+    - name: Tomcat Dir
+      shell: echo {{URL}} | awk -F / {'print $NF'} | sed -e 's/.tar.gz//'
+      register: out
+    - set_fact:
+        tomcat_dir: "{{out.stdout}}"
+
+    - name: Check Tomcat dir exists
+      stat:
+        path: /home/ec2-user/{{tomcat_dir}}
+      register: tomcat_file
+  
+    - debug:
+        msg: "Tomcat already exists, hence skipping download"
+      when: tomcat_file.stat.exists        
+
+    - name: Download Appserver and extract
+      unarchive:
+        src: "{{URL}}"
+        dest: /home/ec2-user/
+        remote_src: yes
+      when: tomcat_file.stat.exists != true
+
+    - name: Adding student war to webapps
+      get_url:
+        url: "{{WAR_URL}}"
+        dest: /home/ec2-user/{{tomcat_dir}}/webapps
+
+    - name: Adding mysql connector
+      get_url:
+        url: https://github.com/cit-aliqui/APP-STACK/raw/master/mysql-connector-java-5.1.40.jar
+        dest: /home/ec2-user/{{tomcat_dir}}/lib
+      
+    - name: Modifing context
+      blockinfile:
+        path: /home/ec2-user/{{tomcat_dir}}/conf/context.xml
+        insertafter: "<Context>"
+        content: |
+          <Resource name="jdbc/TestDB" auth="Container" type="javax.sql.DataSource"
+               maxActive="50" maxIdle="30" maxWait="10000"
+               username="student" password="student@1"
+               driverClassName="com.mysql.jdbc.Driver"
+               url="jdbc:mysql://localhost:3306/studentapp"/>
+    
+    - name: Checking Tomcat status
+      shell: ps -ef | grep tomcat | grep -v grep
+      register: st
+      ignore_errors: yes
+
+    - name: Stop tomcat if running
+      shell: nohup /home/ec2-user/{{tomcat_dir}}/bin/shutdown.sh
+      when:
+        st.rc  == 0
+
+    - name: start tomcat
+      shell: 
+        nohup /home/ec2-user/{{tomcat_dir}}/bin/startup.sh
+
+- name: WEBserver setup
+  hosts: nodes
+  vars:
+    httpd_conn: http://www-us.apache.org/dist/tomcat/tomcat-connectors/jk/tomcat-connectors-1.2.44-src.tar.gz
+    
+  tags: WEB
+  become: yes
+  tasks:
+    - name: Download http
+      package:
+        name: "{{item}}"
+        state: installed
+      loop:
+       - httpd
+       - httpd-devel
+       - gcc 
+        
+    - name: Download httpd connector
+      unarchive:
+        src: "{{httpd_conn}}"
+        dest: /home/ec2-user
+        remote_src: yes
+
+    - name: Httpd connector dir
+      shell: echo {{httpd_conn}} | awk -F / {'print $NF'} | sed -e 's/.tar.gz//'
+      register: out
+    - set_fact:
+       httpd_conn_dir: "{{out.stdout}}"
+
+    - name: genarating mad_jk.so
+      shell: "{{item}}"
+      with_items:
+        - ./configure --with-apxs=/usr/bin/apxs
+        - make
+        - make install
+      args: 
+        chdir: /home/ec2-user/{{httpd_conn_dir}}/native 
+
+    - name: create mod-jk.conf file
+      blockinfile:
+        path: /etc/httpd/conf.d/mod-jk.conf
+        block: |
+            LoadModule jk_module modules/mod_jk.so
+
+            JkWorkersFile conf.d/worker.properties
+            JkMount /student local
+            JkMount /student/* local
+        state: present
+        create: yes
+
+    - name: create worker.properties
+      blockinfile:
+        path: /etc/httpd/conf.d/worker.properties
+        block: |
+            worker.list=local
+            worker.local.host=localhost
+            worker.local.port=8009
+        state: present
+        create: yes  
+
+    - name: start tomcat
+      systemd:
+        name: httpd
+        state: started
+        enabled: True
